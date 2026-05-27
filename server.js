@@ -1,3 +1,5 @@
+[file name]: server.js
+[file content begin]
 const express = require('express')
 const cors = require('cors')
 const path = require('path')
@@ -22,11 +24,11 @@ app.use(express.static(path.join(__dirname, 'public')))
 // Store active pairing sessions
 const sessions = new Map()
 
-// Clean up old sessions every 5 minutes
+// Clean up old incomplete sessions every 5 minutes
 setInterval(() => {
     const now = Date.now()
     for (const [id, session] of sessions.entries()) {
-        if (now - session.createdAt > 5 * 60 * 1000) {
+        if (now - session.createdAt > 3 * 60 * 1000 && !session.paired) {
             try { session.sock?.end?.() } catch (_) {}
             try {
                 const sessionDir = path.join(__dirname, 'sessions', id)
@@ -50,20 +52,15 @@ app.get('/code', async (req, res) => {
         })
     }
 
-    // Return cached code if already generated
     if (sessions.has(number)) {
         const existing = sessions.get(number)
-        if (existing.code) {
+        if (existing.code && !existing.paired && (Date.now() - existing.createdAt) < 2 * 60 * 1000) {
             return res.json({ success: true, code: existing.code })
         }
-        return res.status(429).json({
-            success: false,
-            error: 'Pairing already in progress for this number. Wait 30 seconds.'
-        })
+        sessions.delete(number)
     }
 
     const sessionDir = path.join(__dirname, 'sessions', number)
-    // Always start fresh — delete any old session for this number
     try {
         if (fs.existsSync(sessionDir)) {
             fs.rmSync(sessionDir, { recursive: true, force: true })
@@ -75,8 +72,6 @@ app.get('/code', async (req, res) => {
     try {
         const { state, saveCreds } = await useMultiFileAuthState(sessionDir)
 
-        // FIX 1: Use Browsers.ubuntu('Chrome') — required for pairing code to work
-        // FIX 2: Set browser version correctly for WhatsApp to accept the pairing request
         sock = makeWASocket({
             auth: state,
             printQRInTerminal: false,
@@ -85,36 +80,51 @@ app.get('/code', async (req, res) => {
             generateHighQualityLinkPreview: false,
             connectTimeoutMs: 60000,
             defaultQueryTimeoutMs: 60000,
-            // FIX 3: These two options are critical for pairing code mode
             mobile: false,
         })
 
-        // Mark session as in-progress immediately
-        sessions.set(number, { sock, code: null, createdAt: Date.now() })
+        let pairingResolve
+        const pairingPromise = new Promise((resolve) => { pairingResolve = resolve })
+
+        sessions.set(number, {
+            sock,
+            code: null,
+            createdAt: Date.now(),
+            paired: false,
+            pairingResolve,
+            sessionDir
+        })
+
+        sock.ev.on('creds.update', async () => {
+            const session = sessions.get(number)
+            if (session && !session.paired) {
+                session.paired = true
+                console.log(`✅ Pairing successful for ${number}`)
+                pairingResolve(true)
+                setTimeout(() => {
+                    try { session.sock?.end() } catch (_) {}
+                }, 5000)
+            }
+        })
 
         sock.ev.on('creds.update', saveCreds)
 
-        // FIX 4: Must wait for the connection to be open before requesting pairing code
-        // Don't use a fixed delay — listen for the connection.update event
         await new Promise((resolve, reject) => {
             const timeout = setTimeout(() => {
                 reject(new Error('Connection timeout — WhatsApp did not respond in time'))
             }, 30000)
 
             sock.ev.on('connection.update', async (update) => {
-                const { connection, lastDisconnect, qr } = update
+                const { connection, lastDisconnect } = update
 
-                // FIX 5: When Baileys is ready (qr fires for the first time OR
-                // connection is 'connecting'), that's when we request the pairing code
-                if (qr) {
-                    // QR was generated — intercept it and request pairing code instead
+                if (update.qr) {
                     clearTimeout(timeout)
-                    resolve('ready_for_pairing')
+                    resolve()
                 }
 
                 if (connection === 'open') {
                     clearTimeout(timeout)
-                    resolve('connected')
+                    resolve()
                 }
 
                 if (connection === 'close') {
@@ -125,50 +135,46 @@ app.get('/code', async (req, res) => {
             })
         })
 
-        // FIX 6: requestPairingCode must be called AFTER connection is ready
-        // and only if the number is NOT already registered
-        if (!sock.authState.creds.registered) {
-            // Small buffer to ensure socket is stable
-            await delay(500)
+        await delay(500)
 
-            const code = await sock.requestPairingCode(number)
-
-            if (!code) {
-                throw new Error('WhatsApp returned empty pairing code')
-            }
-
-            const formatted = code.match(/.{1,4}/g)?.join('-') || code
-
-            // Update session with the code
-            const session = sessions.get(number)
-            if (session) session.code = formatted
-
-            // Auto-cleanup after 2 minutes
-            setTimeout(() => {
-                try { sock?.end?.() } catch (_) {}
-                try {
-                    if (fs.existsSync(sessionDir)) {
-                        fs.rmSync(sessionDir, { recursive: true, force: true })
-                    }
-                } catch (_) {}
-                sessions.delete(number)
-            }, 2 * 60 * 1000)
-
-            return res.json({ success: true, code: formatted })
-
-        } else {
-            // Number already has a session — still return success so user can proceed
+        if (sock.authState.creds.registered) {
             sessions.delete(number)
-            try { sock?.end?.() } catch (_) {}
+            try { sock?.end() } catch (_) {}
             return res.status(400).json({
                 success: false,
                 error: 'This number already has an active WhatsApp session linked. Unlink it first in WhatsApp → Linked Devices.'
             })
         }
 
+        const code = await sock.requestPairingCode(number)
+        if (!code) {
+            throw new Error('WhatsApp returned empty pairing code')
+        }
+
+        const formatted = code.match(/.{1,4}/g)?.join('-') || code
+
+        const session = sessions.get(number)
+        if (session) session.code = formatted
+
+        setTimeout(() => {
+            const sess = sessions.get(number)
+            if (sess && !sess.paired) {
+                console.log(`⏰ Pairing timeout for ${number}, cleaning up`)
+                try { sess.sock?.end() } catch (_) {}
+                try {
+                    if (fs.existsSync(sess.sessionDir)) {
+                        fs.rmSync(sess.sessionDir, { recursive: true, force: true })
+                    }
+                } catch (_) {}
+                sessions.delete(number)
+            }
+        }, 3 * 60 * 1000)
+
+        return res.json({ success: true, code: formatted })
+
     } catch (err) {
         console.error('[pair] Error for', number, ':', err.message)
-        try { sock?.end?.() } catch (_) {}
+        try { sock?.end() } catch (_) {}
         try {
             if (fs.existsSync(sessionDir)) {
                 fs.rmSync(sessionDir, { recursive: true, force: true })
@@ -176,7 +182,6 @@ app.get('/code', async (req, res) => {
         } catch (_) {}
         sessions.delete(number)
 
-        // Give user a helpful error message
         let userError = 'Failed to generate pairing code. Try again.'
         if (err.message.includes('timeout')) {
             userError = 'Connection timed out. WhatsApp servers may be busy — try again in 30 seconds.'
@@ -190,21 +195,40 @@ app.get('/code', async (req, res) => {
     }
 })
 
-// ── GET /session?number=256XXXXXXXXX — return session creds as base64 ────────
-// This lets users copy their SESSION_ID for deployment
+// ── GET /session?number=256XXXXXXXXX ────────────────────────────────────────────
 app.get('/session', async (req, res) => {
     const number = (req.query.number || '').replace(/[^0-9]/g, '').trim()
     if (!number) {
         return res.status(400).json({ success: false, error: 'Number required' })
     }
 
-    const sessionDir = path.join(__dirname, 'sessions', number)
-    const credsPath = path.join(sessionDir, 'creds.json')
+    const session = sessions.get(number)
+    if (!session) {
+        return res.status(404).json({
+            success: false,
+            error: 'No active session. Request a pairing code first using /code?number=...'
+        })
+    }
 
+    if (!session.paired) {
+        try {
+            await Promise.race([
+                session.pairingResolve,
+                new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 60000))
+            ])
+        } catch (err) {
+            return res.status(408).json({
+                success: false,
+                error: 'Pairing not completed yet. Please enter the code on your phone and try again in a few seconds.'
+            })
+        }
+    }
+
+    const credsPath = path.join(session.sessionDir, 'creds.json')
     if (!fs.existsSync(credsPath)) {
         return res.status(404).json({
             success: false,
-            error: 'No session found for this number. Complete pairing first.'
+            error: 'Session credentials not found. Pairing may have failed.'
         })
     }
 
@@ -236,3 +260,4 @@ app.get('/', (req, res) => {
 app.listen(PORT, () => {
     console.log(`🦇 IANENIGMA Pair Server running on port ${PORT}`)
 })
+[file content end]
