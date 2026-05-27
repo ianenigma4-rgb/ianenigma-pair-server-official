@@ -1,5 +1,3 @@
-[file name]: server.js
-[file content begin]
 const express = require('express')
 const cors = require('cors')
 const path = require('path')
@@ -260,4 +258,3 @@ app.get('/', (req, res) => {
 app.listen(PORT, () => {
     console.log(`🦇 IANENIGMA Pair Server running on port ${PORT}`)
 })
-[file content end]
