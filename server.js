@@ -1,0 +1,238 @@
+const express = require('express')
+const cors = require('cors')
+const path = require('path')
+const fs = require('fs')
+const pino = require('pino')
+
+const {
+    makeWASocket,
+    useMultiFileAuthState,
+    DisconnectReason,
+    Browsers,
+    delay
+} = require('@whiskeysockets/baileys')
+
+const app = express()
+const PORT = process.env.PORT || 3000
+
+app.use(cors())
+app.use(express.json())
+app.use(express.static(path.join(__dirname, 'public')))
+
+// Store active pairing sessions
+const sessions = new Map()
+
+// Clean up old sessions every 5 minutes
+setInterval(() => {
+    const now = Date.now()
+    for (const [id, session] of sessions.entries()) {
+        if (now - session.createdAt > 5 * 60 * 1000) {
+            try { session.sock?.end?.() } catch (_) {}
+            try {
+                const sessionDir = path.join(__dirname, 'sessions', id)
+                if (fs.existsSync(sessionDir)) {
+                    fs.rmSync(sessionDir, { recursive: true, force: true })
+                }
+            } catch (_) {}
+            sessions.delete(id)
+        }
+    }
+}, 5 * 60 * 1000)
+
+// ── GET /code?number=256XXXXXXXXX ────────────────────────────────────────────
+app.get('/code', async (req, res) => {
+    let number = (req.query.number || '').replace(/[^0-9]/g, '').trim()
+
+    if (!number || number.length < 7 || number.length > 20) {
+        return res.status(400).json({
+            success: false,
+            error: 'Invalid phone number. Include country code e.g. 256700000000'
+        })
+    }
+
+    // Return cached code if already generated
+    if (sessions.has(number)) {
+        const existing = sessions.get(number)
+        if (existing.code) {
+            return res.json({ success: true, code: existing.code })
+        }
+        return res.status(429).json({
+            success: false,
+            error: 'Pairing already in progress for this number. Wait 30 seconds.'
+        })
+    }
+
+    const sessionDir = path.join(__dirname, 'sessions', number)
+    // Always start fresh — delete any old session for this number
+    try {
+        if (fs.existsSync(sessionDir)) {
+            fs.rmSync(sessionDir, { recursive: true, force: true })
+        }
+    } catch (_) {}
+    fs.mkdirSync(sessionDir, { recursive: true })
+
+    let sock
+    try {
+        const { state, saveCreds } = await useMultiFileAuthState(sessionDir)
+
+        // FIX 1: Use Browsers.ubuntu('Chrome') — required for pairing code to work
+        // FIX 2: Set browser version correctly for WhatsApp to accept the pairing request
+        sock = makeWASocket({
+            auth: state,
+            printQRInTerminal: false,
+            logger: pino({ level: 'silent' }),
+            browser: Browsers.ubuntu('Chrome'),
+            generateHighQualityLinkPreview: false,
+            connectTimeoutMs: 60000,
+            defaultQueryTimeoutMs: 60000,
+            // FIX 3: These two options are critical for pairing code mode
+            mobile: false,
+        })
+
+        // Mark session as in-progress immediately
+        sessions.set(number, { sock, code: null, createdAt: Date.now() })
+
+        sock.ev.on('creds.update', saveCreds)
+
+        // FIX 4: Must wait for the connection to be open before requesting pairing code
+        // Don't use a fixed delay — listen for the connection.update event
+        await new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                reject(new Error('Connection timeout — WhatsApp did not respond in time'))
+            }, 30000)
+
+            sock.ev.on('connection.update', async (update) => {
+                const { connection, lastDisconnect, qr } = update
+
+                // FIX 5: When Baileys is ready (qr fires for the first time OR
+                // connection is 'connecting'), that's when we request the pairing code
+                if (qr) {
+                    // QR was generated — intercept it and request pairing code instead
+                    clearTimeout(timeout)
+                    resolve('ready_for_pairing')
+                }
+
+                if (connection === 'open') {
+                    clearTimeout(timeout)
+                    resolve('connected')
+                }
+
+                if (connection === 'close') {
+                    clearTimeout(timeout)
+                    const statusCode = lastDisconnect?.error?.output?.statusCode
+                    reject(new Error(`Connection closed (status: ${statusCode || 'unknown'})`))
+                }
+            })
+        })
+
+        // FIX 6: requestPairingCode must be called AFTER connection is ready
+        // and only if the number is NOT already registered
+        if (!sock.authState.creds.registered) {
+            // Small buffer to ensure socket is stable
+            await delay(500)
+
+            const code = await sock.requestPairingCode(number)
+
+            if (!code) {
+                throw new Error('WhatsApp returned empty pairing code')
+            }
+
+            const formatted = code.match(/.{1,4}/g)?.join('-') || code
+
+            // Update session with the code
+            const session = sessions.get(number)
+            if (session) session.code = formatted
+
+            // Auto-cleanup after 2 minutes
+            setTimeout(() => {
+                try { sock?.end?.() } catch (_) {}
+                try {
+                    if (fs.existsSync(sessionDir)) {
+                        fs.rmSync(sessionDir, { recursive: true, force: true })
+                    }
+                } catch (_) {}
+                sessions.delete(number)
+            }, 2 * 60 * 1000)
+
+            return res.json({ success: true, code: formatted })
+
+        } else {
+            // Number already has a session — still return success so user can proceed
+            sessions.delete(number)
+            try { sock?.end?.() } catch (_) {}
+            return res.status(400).json({
+                success: false,
+                error: 'This number already has an active WhatsApp session linked. Unlink it first in WhatsApp → Linked Devices.'
+            })
+        }
+
+    } catch (err) {
+        console.error('[pair] Error for', number, ':', err.message)
+        try { sock?.end?.() } catch (_) {}
+        try {
+            if (fs.existsSync(sessionDir)) {
+                fs.rmSync(sessionDir, { recursive: true, force: true })
+            }
+        } catch (_) {}
+        sessions.delete(number)
+
+        // Give user a helpful error message
+        let userError = 'Failed to generate pairing code. Try again.'
+        if (err.message.includes('timeout')) {
+            userError = 'Connection timed out. WhatsApp servers may be busy — try again in 30 seconds.'
+        } else if (err.message.includes('closed')) {
+            userError = 'Connection was rejected by WhatsApp. Check your number and try again.'
+        } else if (err.message.includes('empty')) {
+            userError = 'WhatsApp did not return a code. Try again.'
+        }
+
+        return res.status(500).json({ success: false, error: userError })
+    }
+})
+
+// ── GET /session?number=256XXXXXXXXX — return session creds as base64 ────────
+// This lets users copy their SESSION_ID for deployment
+app.get('/session', async (req, res) => {
+    const number = (req.query.number || '').replace(/[^0-9]/g, '').trim()
+    if (!number) {
+        return res.status(400).json({ success: false, error: 'Number required' })
+    }
+
+    const sessionDir = path.join(__dirname, 'sessions', number)
+    const credsPath = path.join(sessionDir, 'creds.json')
+
+    if (!fs.existsSync(credsPath)) {
+        return res.status(404).json({
+            success: false,
+            error: 'No session found for this number. Complete pairing first.'
+        })
+    }
+
+    try {
+        const creds = fs.readFileSync(credsPath, 'utf8')
+        const encoded = Buffer.from(creds).toString('base64')
+        const sessionId = `IANENIGMA;;;${encoded}`
+        return res.json({ success: true, sessionId })
+    } catch (err) {
+        return res.status(500).json({ success: false, error: 'Failed to read session.' })
+    }
+})
+
+// ── Health check ─────────────────────────────────────────────────────────────
+app.get('/health', (req, res) => {
+    res.json({
+        status: 'online',
+        bot: 'IANENIGMA MD BOT',
+        sessions: sessions.size,
+        uptime: Math.floor(process.uptime()) + 's'
+    })
+})
+
+// ── Serve frontend ────────────────────────────────────────────────────────────
+app.get('/', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'))
+})
+
+app.listen(PORT, () => {
+    console.log(`🦇 IANENIGMA Pair Server running on port ${PORT}`)
+})
